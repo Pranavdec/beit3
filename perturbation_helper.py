@@ -73,22 +73,21 @@ def get_grad_cam(grads, cams, modality, img_len=None, text_len=None):
         return text_relearance, final_gradcam
 
 
-def get_rollout(cams, modality, img_len=None, text_len=None):
-    """Attention rollout across layers for the given modality."""
-
+def get_rollout(cams, modality, img_len=None, text_len=None, eps=1e-8):
+    """Attention rollout across layers for the given modality, with debug/info prints."""
     num_layers = len(cams)
     x = None
 
-    for i in range(num_layers):
-
-        cam = cams[i]
+    for i, cam in enumerate(cams):
+        # drop the batch dim if present
         if cam.dim() == 4:
             cam = cam[0]
 
+        # slice out the relevant block
         if modality == "image":
             if img_len is None:
                 raise ValueError("img_len must be provided for image modality")
-            cam_i = cam[:, 1:img_len + 1, 1:img_len + 1]
+            cam_i = cam[:, 1:img_len+1, 1:img_len+1]
         elif modality == "text":
             if img_len is None or text_len is None:
                 raise ValueError("img_len and text_len must be provided for text modality")
@@ -96,28 +95,46 @@ def get_rollout(cams, modality, img_len=None, text_len=None):
             end = start + text_len
             cam_i = cam[:, start:end, start:end]
         else:
-            print("Invalid modality")
+            # print(f"[get_rollout] Invalid modality: {modality!r}")
             return None
-            
-        cam_i_avg = cam_i.mean(dim=0) 
-        
+
+        # average over attention heads
+        cam_i_avg = cam_i.mean(dim=0)
+
+        # debug: check for NaNs in this layer’s average attention
+        if torch.isnan(cam_i_avg).any():
+            n_nan = torch.isnan(cam_i_avg).sum().item()
+            # print(f"[Layer {i}] WARNING: cam_i_avg contains {n_nan} NaNs; replacing with zeros")
+            cam_i_avg = torch.nan_to_num(cam_i_avg, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # initialize or multiply into the rollout
         if x is None:
             x = cam_i_avg.clone()
         else:
-            x = x * cam_i_avg  # Element-wise multiplication
-            x = x / torch.norm(x, p=2)
-            
-    if modality == "image":
-        gradcam = x.cpu().detach().numpy()
-    elif modality == "text":
-        try:
-            gradcam = x.cpu().numpy()
-        except Exception:
-            gradcam = x.detach().cpu().numpy()
+            # debug: show a quick snapshot of x before multiplication
+            # print(f"[Layer {i}] x.norm before multiply = {x.norm(p=2).item():.4f}")
+            x = x * cam_i_avg
 
-    heatmap = gradcam
+            # debug: check for NaNs after multiply
+            if torch.isnan(x).any():
+                n_nan = torch.isnan(x).sum().item()
+                # print(f"[Layer {i}] WARNING: x contains {n_nan} NaNs after multiplication; zeroing those")
+                x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # safe normalization
+            norm_x = x.norm(p=2)
+            if norm_x > eps:
+                x = x / (norm_x + eps)
+            else:
+                # print(f"[Layer {i}] INFO: norm too small ({norm_x.item():.4e}), skipping normalization")
+                pass
+
+    # move to CPU/NumPy and flatten
+    heatmap = x.cpu().detach().numpy()
     heatmap = heatmap.mean(axis=0)
-    heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+    # final normalization
+    min_, max_ = heatmap.min(), heatmap.max()
+    heatmap = (heatmap - min_) / (max_ - min_ + eps)
 
     return heatmap.flatten()
 

@@ -10,38 +10,26 @@ from tqdm import tqdm
 
 import spectral.vqa_data as vqa_data
 from perturbation_helper import get_image_relevance, get_text_relevance
+import modeling_finetune 
+from modeling_finetune import beit3_base_patch16_480_vqav2
 from timm.models import create_model
 import utils
 
-VQA_URL = 'vqa_dict.json'
+ANSWER2LABEL = 'data/answer2label.txt'
 
 
-def load_answer_dict():
-    with open(VQA_URL, 'r') as fp:
-        return json.load(fp)
+def load_answer_dict(path: str = ANSWER2LABEL):
+    """Load answer dictionary mapping index to answer string.
 
-
-class AttentionHook:
-    def __init__(self, module):
-        self.attn = None
-        self.grad = None
-        # 1) on forward—store the raw attn‐probs (out[1])
-        module.register_forward_hook(self._forward_hook)
-        # 2) on backward—grab grad_out[1]
-        module.register_full_backward_hook(self._backward_hook)
-
-    def _forward_hook(self, module, inp, out):
-        # out is (attn_output, attn_probs)
-        if isinstance(out, tuple) and out[1] is not None:
-            self.attn = out[1]
-
-    def _backward_hook(self, module, grad_in, grad_out):
-        # grad_out is a tuple (dL/d out[0], dL/d out[1])
-        if isinstance(grad_out, tuple) and len(grad_out) > 1:
-            self.grad = grad_out[1]
-
-
-
+    The file is expected to contain one JSON object per line with
+    ``{"answer": str, "label": int}`` as used during BEiT-3 fine-tuning.
+    """
+    answer_dict = {}
+    with open(path, 'r') as fp:
+        for line in fp:
+            item = json.loads(line)
+            answer_dict[str(item["label"])] = item["answer"]
+    return answer_dict
 
 
 class BEIT3Perturber:
@@ -49,13 +37,10 @@ class BEIT3Perturber:
         self.device = torch.device(device)
         self.tokenizer = XLMRobertaTokenizer(tokenizer_path)
         model_config = "beit3_base_patch16_480_vqav2"
-        self.model = create_model(
-            model_config,
-            pretrained=False,
-            drop_path_rate=0.1,
-            vocab_size=64010,
-            checkpoint_activations=False,
-        )
+        self.model = beit3_base_patch16_480_vqav2(pretrained=False,
+                                                  drop_path_rate=0.1,
+                                                  vocab_size=64010,
+                                                  checkpoint_activations=False)
 
         utils.load_model_and_may_interpolate(ckpt_path, self.model, 'model', '')
 
@@ -63,7 +48,6 @@ class BEIT3Perturber:
         self.model.eval()
 
         self.answer_dict = load_answer_dict()
-        # self.hooks = [AttentionHook(layer.self_attn) for layer in self.model.beit3.encoder.layers]
 
         self.transform = transforms.Compose([
             transforms.Resize((480, 480)),
@@ -71,12 +55,22 @@ class BEIT3Perturber:
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
 
-    def encode(self, image_path: str, question: str):
+    def encode(self, image_path: str, question: str, max_len: int = 64):
+        """Convert raw inputs to model tensors following training preprocessing."""
         image = Image.open(image_path).convert('RGB')
         image = self.transform(image).unsqueeze(0).to(self.device)
-        tokens = self.tokenizer(question, return_tensors='pt')
-        text_ids = tokens['input_ids'].to(self.device)
-        masks = tokens['attention_mask'].to(self.device)
+
+        tokens = self.tokenizer.tokenize(question)
+        token_ids = self.tokenizer.convert_tokens_to_ids(tokens)
+        if len(token_ids) > max_len - 2:
+            token_ids = token_ids[: max_len - 2]
+        token_ids = [self.tokenizer.bos_token_id] + token_ids + [self.tokenizer.eos_token_id]
+        pad_len = max_len - len(token_ids)
+        text_ids = token_ids + [self.tokenizer.pad_token_id] * pad_len
+        padding_mask = [0] * len(token_ids) + [1] * pad_len
+
+        text_ids = torch.tensor(text_ids, dtype=torch.long).unsqueeze(0).to(self.device)
+        masks = torch.tensor(padding_mask, dtype=torch.long).unsqueeze(0).to(self.device)
         return image, text_ids, masks
 
     def forward(self, image, question_ids, masks):
@@ -109,11 +103,6 @@ class BEIT3Perturber:
             'image_feats': feats[:, 1:img_len, :],
             'text_feats': feats[:, img_len:, :]
         }
-        print(f"Number of layers: {len(grads)}")
-        for i in range(len(grads)):
-            print(f"Layer {i} - Grad shape: {grads[i].shape}, CAM shape: {cams[i].shape}")
-        # print shapes of image and text features
-        print(f"Image feats shape: {ret['image_feats'].shape}, Text feats shape: {ret['text_feats'].shape}")
         
         t_rel = get_text_relevance(ret, grads, cams)
         i_rel = get_image_relevance(ret, grads, cams)
@@ -128,7 +117,7 @@ class PerturbationRunner:
     def __init__(self, perturber: BEIT3Perturber, image_folder: str = None):
         self.perturber = perturber
         self.dataset = vqa_data.VQADataset(splits='valid')
-        self.steps = [0, 0.25, 0.5, 0.75, 0.9, 0.95, 1]
+        self.steps = [0, 0.25, 0.5, 0.75, 0.9, 0.95]
         self.acc_text_pos = [0.0] * len(self.steps)
         self.acc_text_neg = [0.0] * len(self.steps)
         self.acc_img_pos = [0.0] * len(self.steps)
@@ -149,9 +138,10 @@ class PerturbationRunner:
             keep_idx = [0, txt_rel.shape[0] - 1] + [j + 1 for j in idx.cpu().numpy()]
             keep_idx = sorted(keep_idx)
             curr_text = txt_ids[:, keep_idx]
-            curr_mask = torch.ones_like(curr_text)
+            curr_mask = torch.zeros_like(curr_text)
             logits, _ = self.perturber.forward(img, curr_text, curr_mask)
             pred = self.perturber.answer_dict.get(str(logits.argmax().item()), '')
+            print(f"Prediction: {pred} | Label: {item['label']}")
             acc = item['label'].get(pred, 0)
             if positive:
                 self.acc_text_pos[i] += acc
@@ -192,18 +182,21 @@ class PerturbationRunner:
             else:
                 self.acc_img_neg[i] += acc
 
-    def run(self, num_samples=5, method='rm', images_folder=None):
+    def run(self, num_samples=5, method='rm', images_folder=None, seed=42   ):
+        random.seed(seed)
         idxs = list(range(len(self.dataset.data)))
         random.shuffle(idxs)
         idxs = idxs[:num_samples]
         for idx in tqdm(idxs, desc="samples"):
             item = self.dataset.data[idx]
+            print(item)
             img_path = images_folder + item['img_id'] + '.jpg'
             _, feats, img_len = self.perturber.predict(img_path, item['sent'])
             if method == 'rm':
                 t_rel, i_rel = self.perturber.relevance_rm(feats, img_len)
             else:
                 t_rel, i_rel = self.perturber.relevance_upse(feats, img_len)
+
             self._perturb_text(item, t_rel, positive=True)
             self._perturb_text(item, t_rel, positive=False)
             self._perturb_image(item, i_rel, positive=True)
@@ -217,7 +210,7 @@ class PerturbationRunner:
         }
 
         for key, values in results.items():
-            auc = np.trapz(values, self.steps)
+            auc = np.trapezoid(values, self.steps)
             print(f"{key} AUC: {auc:.4f} | y values: {values}")
 
         return results
@@ -231,7 +224,7 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     pert = BEIT3Perturber(ckpt, tokenizer_path, device)
     runner = PerturbationRunner(pert, image_folder=images_folder)
-    results = runner.run(num_samples=2, method='rm', images_folder=images_folder)
+    results = runner.run(num_samples=20, method='rm', images_folder=images_folder)
     print(results)
 
 
