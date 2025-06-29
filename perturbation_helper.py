@@ -55,7 +55,7 @@ def get_grad_cam(grads, cams, modality, img_len=None, text_len=None):
         
         
     if modality == "image":
-        final_gradcam_np = torch.stack(final_gradcam).cpu().numpy()
+        final_gradcam_np = torch.stack(final_gradcam).cpu().detach().numpy()
         final_gradcam_temp = np.mean(final_gradcam_np, axis=0)
         gradcam = final_gradcam_temp
         heatmap = np.mean(gradcam, axis=0)
@@ -116,6 +116,7 @@ def get_rollout(cams, modality, img_len=None, text_len=None):
             gradcam = x.detach().cpu().numpy()
 
     heatmap = gradcam
+    heatmap = heatmap.mean(axis=0)
     heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
 
     return heatmap.flatten()
@@ -225,6 +226,7 @@ def eig_seed(feats, modality, iters)        :
 def get_pca_component(feats, modality, component=0, device="cpu"):
     if feats.size(0) == 1:
         feats = feats.detach().squeeze()
+    original_len = feats.size(0)
 
     if modality == "image":
         n_image_feats = feats.size(0)
@@ -242,7 +244,7 @@ def get_pca_component(feats, modality, component=0, device="cpu"):
     feats_reshaped = feats.cpu().detach().numpy()
 
     # Apply PCA on the reshaped data to get the second principal component
-    pca = PCA(n_components=5)
+    pca = PCA(n_components=2)
     principal_components = pca.fit_transform(feats_reshaped)
 
     # Extract the second principal component and expand to original shape
@@ -256,7 +258,11 @@ def get_pca_component(feats, modality, component=0, device="cpu"):
     
     # Normalize the second principal component for visualization
     second_pc_norm = (second_pc - second_pc.min()) / (second_pc.max() - second_pc.min() + 1e-8)
-    
+
+    if modality == "text" and second_pc_norm.numel() == original_len - 2:
+        # Pad to recover the original token length
+        second_pc_norm = F.pad(second_pc_norm, (1, 1))
+
     return second_pc_norm
 
 def get_image_relevance(ret, grads, cams):
@@ -298,13 +304,10 @@ def get_text_relevance(ret, grads, cam):
     
     image_len = ret['image_feats'].shape[0] if ret['image_feats'].dim() == 2 else ret['image_feats'].shape[1]
     text_len = ret['text_feats'].shape[0] if ret['text_feats'].dim() == 2 else ret['text_feats'].shape[1]
-    print(f"Image length: {image_len}, Text length: {text_len}")
     grad_cam, _ = get_grad_cam(grads, cam, "text", img_len=image_len, text_len=text_len)
     rollout = get_rollout(cam, "text", img_len=image_len, text_len=text_len)
     pca_1 = get_pca_component(ret['text_feats'], "text", 1)
     pca_1 = np.array(pca_1) * 0.01
-
-    print(f"Grad-CAM shape: {grad_cam.shape}, Rollout shape: {rollout.shape}, PCA_1 shape: {pca_1.shape}")
     
     y = np.array([grad_cam,rollout, pca_1])
     y = np.sum(y,axis=0)

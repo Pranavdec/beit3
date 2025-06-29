@@ -125,14 +125,15 @@ class BEIT3Perturber:
 
 
 class PerturbationRunner:
-    def __init__(self, perturber: BEIT3Perturber):
+    def __init__(self, perturber: BEIT3Perturber, image_folder: str = None):
         self.perturber = perturber
         self.dataset = vqa_data.VQADataset(splits='valid')
         self.steps = [0, 0.25, 0.5, 0.75, 0.9, 0.95, 1]
         self.acc = [0.0] * len(self.steps)
+        self.image_folder = image_folder
 
     def perturb(self, item, img_rel, txt_rel):
-        image_file = item['img_id'] + '.jpg'
+        image_file = self.image_folder + (item['img_id'] + '.jpg')
         _, feats, img_len = self.perturber.predict(image_file, item['sent'])
         text_embeds = feats[:, img_len:, :]
         text_mask = torch.ones(text_embeds.shape[1], dtype=torch.long).unsqueeze(0).to(self.perturber.device)
@@ -175,7 +176,7 @@ def main():
     images_folder = '/home/pranav/v2_ExplanableAI/beit3/data/val2014/'
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     pert = BEIT3Perturber(ckpt, tokenizer_path, device)
-    runner = PerturbationRunner(pert)
+    runner = PerturbationRunner(pert, image_folder=images_folder)
     results = runner.run(num_samples=2, method='rm', images_folder=images_folder)
     print(results)
 
