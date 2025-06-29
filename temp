@@ -1,0 +1,162 @@
+diff --git a//dev/null b/perturbation_beit3.py
+index 0000000000000000000000000000000000000000..2cd1bd0b65d99caf5368e508a60d513ed5120195 100644
+--- a//dev/null
++++ b/perturbation_beit3.py
+@@ -0,0 +1,157 @@
++import json
++import random
++from pathlib import Path
++
++import torch
++from PIL import Image
++from torchvision import transforms
++from transformers import XLMRobertaTokenizer
++
++import spectral.vqa_data as vqa_data
++import spectral.vqa_utils as utils
++from perturbation_helper import get_image_relevance, get_text_relevance
++
++from beit3.modeling_finetune import beit3_base_patch16_480_vqav2
++
++VQA_URL = 'spectral/vqa_dict.json'
++
++
++def load_answer_dict():
++    with open(VQA_URL, 'r') as fp:
++        return json.load(fp)
++
++
++class AttentionHook:
++    """Hook to store attention maps and gradients."""
++    def __init__(self, module):
++        self.attn = None
++        self.grad = None
++        module.register_forward_hook(self._forward_hook)
++
++    def _forward_hook(self, module, inp, out):
++        attn = out[1] if isinstance(out, tuple) else out
++        self.attn = attn.detach()
++        attn.register_hook(self._backward_hook)
++
++    def _backward_hook(self, grad):
++        self.grad = grad.detach()
++
++
++class BEIT3Perturber:
++    def __init__(self, ckpt_path: str, tokenizer_path: str, device: str = 'cpu'):
++        self.device = torch.device(device)
++        self.tokenizer = XLMRobertaTokenizer(tokenizer_path)
++        self.model = beit3_base_patch16_480_vqav2(pretrained=False)
++        state = torch.load(ckpt_path, map_location='cpu')
++        if isinstance(state, dict) and 'model' in state:
++            state = state['model']
++        self.model.load_state_dict(state, strict=False)
++        self.model.to(self.device)
++        self.model.eval()
++
++        self.answer_dict = load_answer_dict()
++        self.hooks = [AttentionHook(layer.self_attn) for layer in self.model.beit3.encoder.layers]
++
++        self.transform = transforms.Compose([
++            transforms.Resize((480, 480)),
++            transforms.ToTensor(),
++            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
++        ])
++
++    def encode(self, image_path: str, question: str):
++        image = Image.open(image_path).convert('RGB')
++        image = self.transform(image).unsqueeze(0).to(self.device)
++        tokens = self.tokenizer(question, return_tensors='pt')
++        text_ids = tokens['input_ids'].to(self.device)
++        masks = tokens['attention_mask'].to(self.device)
++        return image, text_ids, masks
++
++    def forward(self, image, question_ids, masks):
++        outputs = self.model.beit3(textual_tokens=question_ids,
++                                   visual_tokens=image,
++                                   text_padding_position=masks)
++        feats = outputs['encoder_out']
++        cls = self.model.pooler(feats)
++        logits = self.model.head(cls)
++        return logits, feats
++
++    def predict(self, image_path: str, question: str):
++        img, txt, mask = self.encode(image_path, question)
++        logits, feats = self.forward(img, txt, mask)
++        answer = self.answer_dict.get(str(logits.argmax().item()), '')
++        img_len = self.model.beit3.vision_embed.num_position_embeddings()
++        return answer, feats, img_len
++
++    def relevance_upse(self, feats, img_len):
++        grads = [h.grad for h in self.hooks]
++        cams = [h.attn for h in self.hooks]
++        ret = {
++            'image_feats': feats[:, 1:img_len, :],
++            'text_feats': feats[:, img_len:, :]
++        }
++        t_rel = get_text_relevance(ret, grads, cams)
++        i_rel = get_image_relevance(ret, grads, cams)
++        return torch.tensor(t_rel), torch.tensor(i_rel)
++
++    def relevance_rm(self, feats, img_len):
++        # reuse UPSE helper with gradients from attention
++        return self.relevance_upse(feats, img_len)
++
++
++class PerturbationRunner:
++    def __init__(self, perturber: BEIT3Perturber):
++        self.perturber = perturber
++        self.dataset = vqa_data.VQADataset(splits='valid')
++        self.steps = [0, 0.25, 0.5, 0.75, 0.9, 0.95, 1]
++        self.acc = [0.0] * len(self.steps)
++
++    def perturb(self, item, img_rel, txt_rel):
++        image_file = item['img_id'] + '.jpg'
++        _, feats, img_len = self.perturber.predict(image_file, item['sent'])
++        text_embeds = feats[:, img_len:, :]
++        text_mask = torch.ones(text_embeds.shape[1], dtype=torch.long).unsqueeze(0).to(self.perturber.device)
++        image_embeds = feats[:, :img_len, :]
++
++        for i, step in enumerate(self.steps):
++            cam_pure = txt_rel[1:-1]
++            keep_t = int((1 - step) * cam_pure.shape[0])
++            _, idx = txt_rel[1:-1].topk(k=keep_t)
++            keep_idx = [0, txt_rel.shape[0]-1] + [j+1 for j in idx.cpu().numpy()]
++            keep_idx = sorted(keep_idx)
++            curr_text = text_embeds[:, keep_idx, :]
++            curr_mask = text_mask[:, keep_idx]
++            logits, _ = self.perturber.forward(image_embeds, curr_text, curr_mask)
++            pred = self.perturber.answer_dict.get(str(logits.argmax().item()), '')
++            acc = item['label'].get(pred, 0)
++            self.acc[i] += acc
++        return self.acc
++
++    def run(self, num_samples=5, method='rm'):
++        idxs = list(range(len(self.dataset.data)))
++        random.shuffle(idxs)
++        idxs = idxs[:num_samples]
++        for idx in idxs:
++            item = self.dataset.data[idx]
++            img_path = item['img_id'] + '.jpg'
++            _, feats, img_len = self.perturber.predict(img_path, item['sent'])
++            if method == 'rm':
++                t_rel, i_rel = self.perturber.relevance_rm(feats, img_len)
++            else:
++                t_rel, i_rel = self.perturber.relevance_upse(feats, img_len)
++            self.perturb(item, i_rel, t_rel)
++        return [a / num_samples for a in self.acc]
++
++
++def main():
++    # Example usage placeholder
++    ckpt = 'beit3_ckpt.pth'
++    tokenizer_path = 'beit3/beit3.spm'
++    device = 'cuda' if torch.cuda.is_available() else 'cpu'
++    pert = BEIT3Perturber(ckpt, tokenizer_path, device)
++    runner = PerturbationRunner(pert)
++    results = runner.run(num_samples=2, method='rm')
++    print(results)
++
++
++if __name__ == '__main__':
++    main()
