@@ -1,15 +1,15 @@
 import json
 import random
-from pathlib import Path
 
 import torch
+import numpy as np
 from PIL import Image
 from torchvision import transforms
 from transformers import XLMRobertaTokenizer
+from tqdm import tqdm
 
 import spectral.vqa_data as vqa_data
 from perturbation_helper import get_image_relevance, get_text_relevance
-import modeling_finetune  
 from timm.models import create_model
 import utils
 
@@ -129,35 +129,74 @@ class PerturbationRunner:
         self.perturber = perturber
         self.dataset = vqa_data.VQADataset(splits='valid')
         self.steps = [0, 0.25, 0.5, 0.75, 0.9, 0.95, 1]
-        self.acc = [0.0] * len(self.steps)
+        self.acc_text_pos = [0.0] * len(self.steps)
+        self.acc_text_neg = [0.0] * len(self.steps)
+        self.acc_img_pos = [0.0] * len(self.steps)
+        self.acc_img_neg = [0.0] * len(self.steps)
         self.image_folder = image_folder
 
-    def perturb(self, item, img_rel, txt_rel):
+    def _perturb_text(self, item, txt_rel, positive=True):
         image_file = self.image_folder + (item['img_id'] + '.jpg')
-        _, feats, img_len = self.perturber.predict(image_file, item['sent'])
-        text_embeds = feats[:, img_len:, :]
-        text_mask = torch.ones(text_embeds.shape[1], dtype=torch.long).unsqueeze(0).to(self.perturber.device)
-        image_embeds = feats[:, :img_len, :]
+        img, txt_ids, _ = self.perturber.encode(image_file, item['sent'])
 
         for i, step in enumerate(self.steps):
             cam_pure = txt_rel[1:-1]
             keep_t = int((1 - step) * cam_pure.shape[0])
-            _, idx = txt_rel[1:-1].topk(k=keep_t)
-            keep_idx = [0, txt_rel.shape[0]-1] + [j+1 for j in idx.cpu().numpy()]
+            if positive:
+                _, idx = cam_pure.topk(k=keep_t)
+            else:
+                _, idx = (-cam_pure).topk(k=keep_t)
+            keep_idx = [0, txt_rel.shape[0] - 1] + [j + 1 for j in idx.cpu().numpy()]
             keep_idx = sorted(keep_idx)
-            curr_text = text_embeds[:, keep_idx, :]
-            curr_mask = text_mask[:, keep_idx]
-            logits, _ = self.perturber.forward(image_embeds, curr_text, curr_mask)
+            curr_text = txt_ids[:, keep_idx]
+            curr_mask = torch.ones_like(curr_text)
+            logits, _ = self.perturber.forward(img, curr_text, curr_mask)
             pred = self.perturber.answer_dict.get(str(logits.argmax().item()), '')
             acc = item['label'].get(pred, 0)
-            self.acc[i] += acc
-        return self.acc
+            if positive:
+                self.acc_text_pos[i] += acc
+            else:
+                self.acc_text_neg[i] += acc
+
+    def _apply_patch_mask(self, image, mask_vec):
+        num_patches = int(mask_vec.numel())
+        side = int(num_patches ** 0.5)
+        patch_h = image.shape[-2] // side
+        patch_w = image.shape[-1] // side
+        mask_2d = mask_vec.view(side, side)
+        img = image.clone()
+        for r in range(side):
+            for c in range(side):
+                if mask_2d[r, c] == 0:
+                    img[:, :, r * patch_h:(r + 1) * patch_h, c * patch_w:(c + 1) * patch_w] = 0
+        return img
+
+    def _perturb_image(self, item, img_rel, positive=True):
+        image_file = self.image_folder + (item['img_id'] + '.jpg')
+        img, txt_ids, mask = self.perturber.encode(image_file, item['sent'])
+        img_rel = img_rel.flatten()
+        for i, step in enumerate(self.steps):
+            keep_p = int((1 - step) * img_rel.shape[0])
+            if positive:
+                _, idx = img_rel.topk(k=keep_p)
+            else:
+                _, idx = (-img_rel).topk(k=keep_p)
+            mask_vec = torch.zeros_like(img_rel, dtype=torch.long)
+            mask_vec[idx] = 1
+            masked_img = self._apply_patch_mask(img, mask_vec)
+            logits, _ = self.perturber.forward(masked_img, txt_ids, mask)
+            pred = self.perturber.answer_dict.get(str(logits.argmax().item()), '')
+            acc = item['label'].get(pred, 0)
+            if positive:
+                self.acc_img_pos[i] += acc
+            else:
+                self.acc_img_neg[i] += acc
 
     def run(self, num_samples=5, method='rm', images_folder=None):
         idxs = list(range(len(self.dataset.data)))
         random.shuffle(idxs)
         idxs = idxs[:num_samples]
-        for idx in idxs:
+        for idx in tqdm(idxs, desc="samples"):
             item = self.dataset.data[idx]
             img_path = images_folder + item['img_id'] + '.jpg'
             _, feats, img_len = self.perturber.predict(img_path, item['sent'])
@@ -165,8 +204,23 @@ class PerturbationRunner:
                 t_rel, i_rel = self.perturber.relevance_rm(feats, img_len)
             else:
                 t_rel, i_rel = self.perturber.relevance_upse(feats, img_len)
-            self.perturb(item, i_rel, t_rel)
-        return [a / num_samples for a in self.acc]
+            self._perturb_text(item, t_rel, positive=True)
+            self._perturb_text(item, t_rel, positive=False)
+            self._perturb_image(item, i_rel, positive=True)
+            self._perturb_image(item, i_rel, positive=False)
+
+        results = {
+            'text_positive': [a / num_samples for a in self.acc_text_pos],
+            'text_negative': [a / num_samples for a in self.acc_text_neg],
+            'image_positive': [a / num_samples for a in self.acc_img_pos],
+            'image_negative': [a / num_samples for a in self.acc_img_neg],
+        }
+
+        for key, values in results.items():
+            auc = np.trapz(values, self.steps)
+            print(f"{key} AUC: {auc:.4f} | y values: {values}")
+
+        return results
 
 
 def main():
