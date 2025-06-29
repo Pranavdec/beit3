@@ -10,29 +10,37 @@ from scipy.sparse import diags
 from sklearn.decomposition import PCA
 import math
 
-
-
-
 def get_grad_cam(grads, cams, modality, img_len=None, text_len=None):
+    """Compute Grad-CAM for image or text tokens.
+
+    The attention maps and gradients may come either in ``(B, H, N, N)`` format
+    or ``(H, N, N)`` if the batch dimension was stripped by hooks.  This helper
+    handles both representations.
+    """
+
     final_gradcam = []
     num_layers = len(cams)
     for i in range(num_layers):
-        # Get gradients and attention maps for this layer
         grad = grads[i]
         cam = cams[i]
+
+        if grad.dim() == 4:
+            grad = grad[0]
+        if cam.dim() == 4:
+            cam = cam[0]
 
         if modality == "image":
             if img_len is None:
                 raise ValueError("img_len must be provided for image modality")
-            cam = cam[:, :, 1:img_len + 1, 1:img_len + 1]
-            grad = grad[:, :, 1:img_len + 1, 1:img_len + 1].clamp(0)
+            cam = cam[:, 1:img_len + 1, 1:img_len + 1]
+            grad = grad[:, 1:img_len + 1, 1:img_len + 1].clamp(0)
         elif modality == "text":
             if img_len is None or text_len is None:
                 raise ValueError("img_len and text_len must be provided for text modality")
-            start = img_len + 1  # skip cls and image tokens
+            start = img_len + 1
             end = start + text_len
-            cam = cam[:, :, start:end, start:end]
-            grad = grad[:, :, start:end, start:end].clamp(0)
+            cam = cam[:, start:end, start:end]
+            grad = grad[:, start:end, start:end].clamp(0)
         else:
             print("Invalid modality")
             return None
@@ -49,8 +57,6 @@ def get_grad_cam(grads, cams, modality, img_len=None, text_len=None):
     if modality == "image":
         final_gradcam_np = torch.stack(final_gradcam).cpu().numpy()
         final_gradcam_temp = np.mean(final_gradcam_np, axis=0)
-        final_gradcam_temp = final_gradcam_temp.squeeze()
-
         gradcam = final_gradcam_temp
         heatmap = np.mean(gradcam, axis=0)
         heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
@@ -59,32 +65,36 @@ def get_grad_cam(grads, cams, modality, img_len=None, text_len=None):
         
         
     elif modality == "text":
-        # Stack tensors and convert to numpy
-        final_gradcam_np = torch.stack(final_gradcam).cpu().numpy()  # shape: [6, 1, 20, 20]
-        final_gradcam_temp = np.mean(final_gradcam_np, axis=0)       # shape: [1, 20, 20]
-        final_gradcam_temp = final_gradcam_temp.squeeze(0)
+        final_gradcam_np = torch.stack(final_gradcam).cpu().detach().numpy()
+        final_gradcam_temp = np.mean(final_gradcam_np, axis=0)
         text_relearance = np.mean(final_gradcam_temp, axis=0)
         text_relearance = (text_relearance - text_relearance.min()) / (text_relearance.max() - text_relearance.min() + 1e-8)
-        
-        return text_relearance , final_gradcam
+
+        return text_relearance, final_gradcam
 
 
 def get_rollout(cams, modality, img_len=None, text_len=None):
+    """Attention rollout across layers for the given modality."""
+
     num_layers = len(cams)
     x = None
 
     for i in range(num_layers):
 
+        cam = cams[i]
+        if cam.dim() == 4:
+            cam = cam[0]
+
         if modality == "image":
             if img_len is None:
                 raise ValueError("img_len must be provided for image modality")
-            cam_i = cams[i][0][1:img_len + 1, 1:img_len + 1]
+            cam_i = cam[:, 1:img_len + 1, 1:img_len + 1]
         elif modality == "text":
             if img_len is None or text_len is None:
                 raise ValueError("img_len and text_len must be provided for text modality")
             start = img_len + 1
             end = start + text_len
-            cam_i = cams[i][0][start:end, start:end]
+            cam_i = cam[:, start:end, start:end]
         else:
             print("Invalid modality")
             return None
@@ -108,7 +118,8 @@ def get_rollout(cams, modality, img_len=None, text_len=None):
     heatmap = gradcam
     heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
 
-    return heatmap
+    return heatmap.flatten()
+
 
 def get_diagonal (W):
     D = row_sum(W)
@@ -287,10 +298,13 @@ def get_text_relevance(ret, grads, cam):
     
     image_len = ret['image_feats'].shape[0] if ret['image_feats'].dim() == 2 else ret['image_feats'].shape[1]
     text_len = ret['text_feats'].shape[0] if ret['text_feats'].dim() == 2 else ret['text_feats'].shape[1]
+    print(f"Image length: {image_len}, Text length: {text_len}")
     grad_cam, _ = get_grad_cam(grads, cam, "text", img_len=image_len, text_len=text_len)
     rollout = get_rollout(cam, "text", img_len=image_len, text_len=text_len)
     pca_1 = get_pca_component(ret['text_feats'], "text", 1)
     pca_1 = np.array(pca_1) * 0.01
+
+    print(f"Grad-CAM shape: {grad_cam.shape}, Rollout shape: {rollout.shape}, PCA_1 shape: {pca_1.shape}")
     
     y = np.array([grad_cam,rollout, pca_1])
     y = np.sum(y,axis=0)
